@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from waymax import datatypes
 from waymax import metrics as waymax_metrics
 from waymax.env.planning_agent_environment import PlanningAgentEnvironment
+from waymax.utils import geometry as waymax_geometry
 
 from vmax.simulator import metrics, operations
 from vmax.simulator.wrappers.base import Wrapper
@@ -80,10 +81,12 @@ def _get_reward_fn(reward_name: str) -> callable:
         "log_div_clip": _compute_log_divergence_clip_reward,
         "log_div": _compute_log_divergence_reward,
         "overlap": _compute_overlap_reward,
+        "proximity": _compute_proximity_reward,
         "offroad": _compute_offroad_reward,
         "offroad_in_box": _compute_offroad_in_box_reward,
         "off_route": _compute_off_route_reward,
         "below_ttc": _compute_below_ttc_reward,
+        "below_ttc_all": _compute_below_ttc_all_reward,
         "red_light": _compute_red_light_reward,
         "comfort": _compute_comfort_reward,
         "overspeed": _compute_overspeed_limit_reward,
@@ -118,6 +121,43 @@ def _compute_overlap_reward(state: datatypes.SimulatorState) -> bool:
     sdc_overlap = jax.tree.map(lambda x: x[sdc_idx], overlap)
 
     return sdc_overlap == 1.0
+
+
+def _compute_proximity_reward(
+    state: datatypes.SimulatorState,
+    longitudinal_margin: float = 1.0,
+    lateral_margin: float = 0.5,
+) -> bool:
+    """Penalize objects entering an expanded safety envelope around the SDC."""
+    current_traj = datatypes.dynamic_slice(
+        state.sim_trajectory,
+        state.timestep,
+        1,
+        -1,
+    )
+
+    sdc_idx = operations.get_index(state.object_metadata.is_sdc)
+
+    traj_5dof = current_traj.stack_fields(
+        ["x", "y", "length", "width", "yaw"]
+    ).squeeze()
+
+    # Expand only the SDC bounding box. Length and width are full dimensions,
+    # so adding a margin on both sides requires twice the desired margin.
+    expanded_traj = traj_5dof.at[sdc_idx, 2].add(2.0 * longitudinal_margin)
+    expanded_traj = expanded_traj.at[sdc_idx, 3].add(2.0 * lateral_margin)
+
+    pairwise_overlap = waymax_geometry.compute_pairwise_overlaps(expanded_traj)
+
+    valid = current_traj.valid.squeeze()
+
+    proximity = pairwise_overlap[sdc_idx]
+    proximity = jnp.logical_and(proximity, valid)
+
+    # Ignore overlap with itself.
+    proximity = proximity.at[sdc_idx].set(False)
+
+    return jnp.any(proximity)
 
 
 def _compute_offroad_reward(state: datatypes.SimulatorState) -> bool:
@@ -215,6 +255,39 @@ def _compute_below_ttc_reward(state: datatypes.SimulatorState, threshold: float 
     ttc = metrics.TimeToCollisionMetric().compute(state).value
 
     return ttc < threshold
+
+
+def _compute_below_ttc_all_reward(
+    state: datatypes.SimulatorState,
+    threshold: float = 1.5,
+) -> bool:
+    """Penalize predicted collisions with any valid surrounding object.
+
+    Unlike _compute_below_ttc_reward(), this reward does not filter objects
+    using the ego-front 'is_ahead' condition. It reuses the same OBB-based
+    constant-velocity collision prediction from TimeToCollisionMetric.
+    """
+    current_traj = datatypes.dynamic_slice(
+        state.sim_trajectory,
+        state.timestep,
+        1,
+        -1,
+    )
+
+    sdc_idx = operations.get_index(state.object_metadata.is_sdc)
+
+    ttc_metric = metrics.TimeToCollisionMetric()
+
+    ttc, _ = ttc_metric._compute_ttc(
+        current_traj,
+        sdc_idx,
+        dt=0.1,
+        time_horizon=5.0,
+    )
+
+    min_ttc_all = jnp.min(ttc)
+
+    return min_ttc_all < threshold
 
 
 def _compute_off_route_reward(state: datatypes.SimulatorState) -> bool:
