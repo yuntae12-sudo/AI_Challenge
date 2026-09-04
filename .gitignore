@@ -176,3 +176,11 @@ poetry.toml
 pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python
+
+# Evaluation outputs
+benchmark/
+
+# Training checkpoints / runtime outputs
+runs/
+*.pkl
+*.tfrecord
