@@ -39,6 +39,9 @@ def train(
     seed: int,
     learning_start: int,
     alpha: float,
+    smoothness_lambda: float,
+    smoothness_accel_threshold: float,
+    smoothness_steer_threshold: float,
     discount: float,
     tau: float,
     save_freq: int,
@@ -110,7 +113,15 @@ def train(
         num_devices,
         network_key,
     )
-    learning_fn = sac.make_sgd_step(network, alpha, discount, tau)
+    learning_fn = sac.make_sgd_step(
+        network,
+        alpha,
+        discount,
+        tau,
+        smoothness_lambda=smoothness_lambda,
+        smoothness_accel_threshold=smoothness_accel_threshold,
+        smoothness_steer_threshold=smoothness_steer_threshold,
+    )
     step_fn = partial(inference.policy_step, use_partial_transition=True)
 
     replay_buffer = ReplayBuffer(

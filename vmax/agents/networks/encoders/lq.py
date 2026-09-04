@@ -145,6 +145,7 @@ class LQEncoder(nn.Module):
     attn_dropout: float = 0.0
     ff_dropout: float = 0.0
     tie_layer_weights: bool = False
+    use_object_rank_pe: bool = True
 
     @nn.compact
     def __call__(self, obs: jax.Array) -> jax.Array:
@@ -211,8 +212,30 @@ class LQEncoder(nn.Module):
         sdc_traj_encoding += jnp.expand_dims(
             self.param("sdc_traj_pe", init.normal(), (1, timestep_agent, self.dk)), 0
         )
+        # Other-object positional encoding.
+        #
+        # Legacy/default:
+        #   slot-specific PE:
+        #   (num_objects, timestep_agent, dk)
+        #
+        # V29:
+        #   shared temporal-only PE:
+        #   (1, timestep_agent, dk)
+        #
+        # The leading object dimension is broadcast across
+        # every selected object when rank-specific PE is disabled.
+        other_traj_pe_shape = (
+            (num_objects, timestep_agent, self.dk)
+            if self.use_object_rank_pe
+            else (1, timestep_agent, self.dk)
+        )
+
         other_traj_encoding += jnp.expand_dims(
-            self.param("other_traj_pe", init.normal(), (num_objects, timestep_agent, self.dk)),
+            self.param(
+                "other_traj_pe",
+                init.normal(),
+                other_traj_pe_shape,
+            ),
             0,
         )
         rg_encoding += jnp.expand_dims(

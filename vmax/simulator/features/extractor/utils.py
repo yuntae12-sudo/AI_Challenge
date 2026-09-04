@@ -8,6 +8,7 @@ import jax.numpy as jnp
 
 MAX_METERS = 50  # m
 MAX_SPEED = 30  # m/s
+CLEARANCE_SCALE = 10.0  # m; signed clearance normalization
 
 # https://waymo.com/open/data/motiontfexample.
 # LANE_UNDEFINED = 0 -> 0
@@ -64,7 +65,17 @@ def get_feature_size(feature_key: str, dict_mapping: dict) -> int:
     """
     if feature_key in ["xy", "vel_xy", "dir_xy"]:
         return 2
-    elif feature_key in ["speed", "length", "width", "height", "valid", "yaw", "arc_length"]:
+    elif feature_key in [
+        "speed",
+        "length",
+        "width",
+        "height",
+        "valid",
+        "yaw",
+        "arc_length",
+        "static_clearance",
+        "predicted_clearance",
+    ]:
         return 1
     elif feature_key == "state":
         return max(dict_mapping["state"])
@@ -121,6 +132,13 @@ def normalize_by_feature(
         data = data / MAX_SPEED  # m/s
     elif feature_key in ["length", "width", "height"]:
         data = data / meters  # m
+    elif feature_key in ["static_clearance", "predicted_clearance"]:
+        data = jnp.clip(
+            data,
+            min=-CLEARANCE_SCALE,
+            max=CLEARANCE_SCALE,
+        )
+        data = data / CLEARANCE_SCALE
     elif feature_key in ["valid", "yaw", "arc_length", "dir_xy", "ids"]:
         pass
     else:

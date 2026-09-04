@@ -1,0 +1,2941 @@
+from pathlib import Path
+import runpy
+
+import jax
+import numpy as np
+import pandas as pd
+
+from vmax.scripts.evaluate import utils
+from vmax.simulator import datasets, make_data_generator
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+DATASET = (
+    "/mnt/e/AI_Challenge/datasets/splits/"
+    "secondary_val_1024/secondary_val_1024.tfrecord@1024"
+)
+
+MODEL = "v28_secondary_frozen_19970560"
+
+ROOT = Path(
+    "benchmark/ai/mnt/e/AI_Challenge/datasets/splits/"
+    "secondary_val_1024/"
+    "secondary_val_1024.tfrecord@1024"
+)
+
+V26_EVAL = (
+    ROOT
+    / "v27_secondary_frozen_21506560"
+    / "model_final"
+    / "evaluation_episodes.csv"
+)
+
+V27_EVAL = (
+    ROOT
+    / "v28_secondary_frozen_19970560"
+    / "model_final"
+    / "evaluation_episodes.csv"
+)
+
+PAIR_PATH = Path(
+    "analysis/v27_v28_directional_pair.csv"
+)
+
+OUT_PATH = Path(
+    "analysis/v29_directional_v28.csv"
+)
+
+MAX_OBJECTS = 64
+NUM_CLOSEST_OBJECTS = 16
+
+BATCH_SIZE = 64
+DT = 0.1
+
+LEADS = [
+    3.0,
+    2.0,
+    1.0,
+    0.5,
+]
+
+NUM_SAFE = 60
+
+
+# ============================================================
+# REUSE VERIFIED BATCH EXTRACTION
+# ============================================================
+
+rankmod = runpy.run_path(
+    "analysis/diagnose_v26_collision_rank.py"
+)
+
+take_batch_item = rankmod[
+    "take_batch_item"
+]
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def as_bool(series):
+    if series.dtype == bool:
+        return series
+
+    return (
+        series
+        .astype(str)
+        .str.lower()
+        .map({
+            "true": True,
+            "false": False,
+        })
+        .fillna(False)
+        .astype(bool)
+    )
+
+
+def auc_pairwise(
+    positive,
+    negative,
+    higher_is_risk=False,
+):
+    p = np.asarray(
+        positive,
+        dtype=float,
+    )
+
+    n = np.asarray(
+        negative,
+        dtype=float,
+    )
+
+    p = p[
+        np.isfinite(p)
+    ]
+
+    n = n[
+        np.isfinite(n)
+    ]
+
+    if (
+        len(p) == 0
+        or len(n) == 0
+    ):
+        return np.nan
+
+    if higher_is_risk:
+        wins = (
+            p[:, None]
+            > n[None, :]
+        )
+    else:
+        wins = (
+            p[:, None]
+            < n[None, :]
+        )
+
+    ties = (
+        p[:, None]
+        == n[None, :]
+    )
+
+    return float(
+        wins.mean()
+        + 0.5 * ties.mean()
+    )
+
+
+# ============================================================
+# INTERACTION SNAPSHOT
+# ============================================================
+
+def interaction_snapshot(
+    state,
+    feature_extractor,
+):
+    """
+    Reproduce V27 interaction geometry from current causal state.
+
+    V27:
+      static_clearance
+      predicted_clearance
+
+    Candidate V28:
+      tcpa_clipped
+      future_tcpa
+      approaching
+
+    future_tcpa:
+      tcpa_raw > 0 -> clip(tcpa_raw, 0, 5)
+      tcpa_raw <= 0 -> 5
+
+    This avoids treating a diverging object as
+    "immediate TCPA = 0".
+    """
+
+    # Evaluation state is vmap(batch=1).
+    if state.batch_dims:
+        if tuple(state.batch_dims) != (1,):
+            raise RuntimeError(
+                f"Unexpected batch_dims: "
+                f"{state.batch_dims}"
+            )
+
+        state = jax.tree.map(
+            lambda x: x[0],
+            state,
+        )
+
+
+    # Same SDC-local representation used by policy.
+    sdc_obs = (
+        feature_extractor
+        ._get_sdc_observation(
+            state
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # Current state
+    # --------------------------------------------------------
+
+    xy = np.asarray(
+        sdc_obs.trajectory.xy[
+            :,
+            -1,
+            :,
+        ],
+        dtype=float,
+    )
+
+    vel = np.asarray(
+        sdc_obs.trajectory.vel_xy[
+            :,
+            -1,
+            :,
+        ],
+        dtype=float,
+    )
+
+    length = np.asarray(
+        sdc_obs.trajectory.length[
+            :,
+            -1,
+        ],
+        dtype=float,
+    )
+
+    width = np.asarray(
+        sdc_obs.trajectory.width[
+            :,
+            -1,
+        ],
+        dtype=float,
+    )
+
+    valid = np.asarray(
+        sdc_obs.trajectory.valid[
+            :,
+            -1,
+        ]
+    ).astype(bool)
+
+
+    # --------------------------------------------------------
+    # Find ego.
+    #
+    # In SDC-local coordinates ego is distance ~0.
+    # --------------------------------------------------------
+
+    dist_from_origin = np.linalg.norm(
+        xy,
+        axis=-1,
+    )
+
+    valid_dist = np.where(
+        valid,
+        dist_from_origin,
+        np.inf,
+    )
+
+    ego = int(
+        np.argmin(
+            valid_dist
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # Reproduce V27 closest-object selection:
+    # ego + 16 closest objects.
+    # --------------------------------------------------------
+
+    order = np.argsort(
+        valid_dist
+    )
+
+    selected = [
+        int(i)
+        for i in order
+        if valid[i]
+    ][
+        : NUM_CLOSEST_OBJECTS + 1
+    ]
+
+    objects = [
+        i
+        for i in selected
+        if i != ego
+    ][
+        :NUM_CLOSEST_OBJECTS
+    ]
+
+    if len(objects) == 0:
+        return None
+
+
+    # --------------------------------------------------------
+    # Ego geometry
+    # --------------------------------------------------------
+
+    ego_xy = xy[ego]
+    ego_vel = vel[ego]
+
+    ego_radius = (
+        0.5
+        * np.sqrt(
+            length[ego] ** 2
+            + width[ego] ** 2
+        )
+    )
+
+
+    rows = []
+
+    for obj in objects:
+
+        r = (
+            xy[obj]
+            - ego_xy
+        )
+
+        v = (
+            vel[obj]
+            - ego_vel
+        )
+
+        center_distance = float(
+            np.linalg.norm(r)
+        )
+
+        object_radius = (
+            0.5
+            * np.sqrt(
+                length[obj] ** 2
+                + width[obj] ** 2
+            )
+        )
+
+        radius_sum = (
+            ego_radius
+            + object_radius
+        )
+
+
+        # ----------------------------------------------------
+        # V27 static clearance
+        # ----------------------------------------------------
+
+        static_clearance = float(
+            center_distance
+            - radius_sum
+        )
+
+
+        # ----------------------------------------------------
+        # Same V27 TCPA formula
+        # ----------------------------------------------------
+
+        relative_speed_sq = float(
+            np.dot(
+                v,
+                v,
+            )
+        )
+
+        position_velocity_dot = float(
+            np.dot(
+                r,
+                v,
+            )
+        )
+
+        if relative_speed_sq > 1e-6:
+            tcpa_raw = (
+                -position_velocity_dot
+                / relative_speed_sq
+            )
+        else:
+            tcpa_raw = 0.0
+
+
+        tcpa_clipped = float(
+            np.clip(
+                tcpa_raw,
+                0.0,
+                5.0,
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # Proposed time representation.
+        #
+        # Negative raw TCPA means closest approach was in the
+        # past / object is diverging.
+        #
+        # Encode that as max horizon rather than zero.
+        # ----------------------------------------------------
+
+        if tcpa_raw > 0.0:
+            future_tcpa = float(
+                min(
+                    tcpa_raw,
+                    5.0,
+                )
+            )
+        else:
+            future_tcpa = 5.0
+
+
+        approaching = bool(
+            tcpa_raw > 0.0
+            and tcpa_raw <= 5.0
+        )
+
+
+        # ----------------------------------------------------
+        # V27 predicted clearance
+        # ----------------------------------------------------
+
+        closest_relative_xy = (
+            r
+            + tcpa_clipped
+            * v
+        )
+
+        dcpa = float(
+            np.linalg.norm(
+                closest_relative_xy
+            )
+        )
+
+        predicted_clearance = float(
+            dcpa
+            - radius_sum
+        )
+
+
+        # Radial closing speed, diagnostic only.
+        if center_distance > 1e-6:
+            closing_speed = float(
+                -np.dot(
+                    r / center_distance,
+                    v,
+                )
+            )
+        else:
+            closing_speed = 0.0
+
+
+        rows.append({
+            "object_index":
+                obj,
+
+            "distance":
+                center_distance,
+
+            "static_clearance":
+                static_clearance,
+
+            "predicted_clearance":
+                predicted_clearance,
+
+            "dcpa":
+                dcpa,
+
+            "tcpa_raw":
+                float(tcpa_raw),
+
+            "tcpa_clipped":
+                tcpa_clipped,
+
+            "future_tcpa":
+                future_tcpa,
+
+            "approaching":
+                int(approaching),
+
+            "closing_speed":
+                closing_speed,
+        })
+
+
+    obj_df = pd.DataFrame(
+        rows
+    )
+
+
+    # --------------------------------------------------------
+    # Object V27 considers geometrically most dangerous:
+    # minimum predicted clearance.
+    # --------------------------------------------------------
+
+    # --------------------------------------------------------
+    # Order objects by V27 predicted clearance.
+    #
+    # first  = object V27 already considers most dangerous
+    # second = second-most-dangerous interaction candidate
+    # --------------------------------------------------------
+
+    ordered = (
+        obj_df
+        .sort_values(
+            "predicted_clearance",
+            ascending=True,
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+    risk = ordered.iloc[0]
+
+    if len(ordered) >= 2:
+        second = ordered.iloc[1]
+    else:
+        second = ordered.iloc[0]
+
+    first_pred = float(
+        risk[
+            "predicted_clearance"
+        ]
+    )
+
+    second_pred = float(
+        second[
+            "predicted_clearance"
+        ]
+    )
+
+    top2_mean_pred = float(
+        0.5
+        * (
+            first_pred
+            + second_pred
+        )
+    )
+
+    second_minus_first_gap = float(
+        second_pred
+        - first_pred
+    )
+
+
+    # --------------------------------------------------------
+    # Additional conflict counts.
+    # --------------------------------------------------------
+
+    conflict0 = obj_df[
+        obj_df[
+            "predicted_clearance"
+        ] <= 0.0
+    ]
+
+    conflict1 = obj_df[
+        obj_df[
+            "predicted_clearance"
+        ] <= 1.0
+    ]
+
+    conflict2 = obj_df[
+        obj_df[
+            "predicted_clearance"
+        ] <= 2.0
+    ]
+
+
+    def min_future_tcpa(x):
+        if len(x) == 0:
+            return 5.0
+
+        return float(
+            x[
+                "future_tcpa"
+            ].min()
+        )
+
+
+    return {
+        "risk_object_index":
+            int(
+                risk[
+                    "object_index"
+                ]
+            ),
+
+        "risk_distance":
+            float(
+                risk[
+                    "distance"
+                ]
+            ),
+
+        "risk_static_clearance":
+            float(
+                risk[
+                    "static_clearance"
+                ]
+            ),
+
+        "risk_predicted_clearance":
+            float(
+                risk[
+                    "predicted_clearance"
+                ]
+            ),
+
+        "risk_dcpa":
+            float(
+                risk[
+                    "dcpa"
+                ]
+            ),
+
+        "risk_tcpa_raw":
+            float(
+                risk[
+                    "tcpa_raw"
+                ]
+            ),
+
+        "risk_tcpa_clipped":
+            float(
+                risk[
+                    "tcpa_clipped"
+                ]
+            ),
+
+        "risk_future_tcpa":
+            float(
+                risk[
+                    "future_tcpa"
+                ]
+            ),
+
+        "risk_approaching":
+            int(
+                risk[
+                    "approaching"
+                ]
+            ),
+
+        "risk_closing_speed":
+            float(
+                risk[
+                    "closing_speed"
+                ]
+            ),
+
+        # ----------------------------------------------------
+        # SECOND-RISK interaction geometry
+        # ----------------------------------------------------
+
+        "second_object_index":
+            int(
+                second[
+                    "object_index"
+                ]
+            ),
+
+        "second_distance":
+            float(
+                second[
+                    "distance"
+                ]
+            ),
+
+        "second_static_clearance":
+            float(
+                second[
+                    "static_clearance"
+                ]
+            ),
+
+        "second_predicted_clearance":
+            float(
+                second[
+                    "predicted_clearance"
+                ]
+            ),
+
+        "second_dcpa":
+            float(
+                second[
+                    "dcpa"
+                ]
+            ),
+
+        "second_future_tcpa":
+            float(
+                second[
+                    "future_tcpa"
+                ]
+            ),
+
+        "second_approaching":
+            int(
+                second[
+                    "approaching"
+                ]
+            ),
+
+        "top2_mean_predicted_clearance":
+            top2_mean_pred,
+
+        "second_minus_first_pred_gap":
+            second_minus_first_gap,
+
+        "num_pred_conflict_0":
+            int(
+                len(
+                    conflict0
+                )
+            ),
+
+        "num_pred_conflict_1":
+            int(
+                len(
+                    conflict1
+                )
+            ),
+
+        "num_pred_conflict_2":
+            int(
+                len(
+                    conflict2
+                )
+            ),
+
+        "min_future_tcpa_conflict_0":
+            min_future_tcpa(
+                conflict0
+            ),
+
+        "min_future_tcpa_conflict_1":
+            min_future_tcpa(
+                conflict1
+            ),
+
+        "min_future_tcpa_conflict_2":
+            min_future_tcpa(
+                conflict2
+            ),
+    }
+
+
+# ============================================================
+# ROLLOUT
+# ============================================================
+
+def rollout(
+    scenario,
+    scenario_key,
+    reset_fn,
+    step_fn,
+):
+    # --------------------------------------------------------
+    # EXACT evaluator RNG semantics.
+    #
+    # scenario_key is the key produced by:
+    #
+    #   rng_key, batch_key = random.split(rng_key)
+    #   scenario_keys = random.split(batch_key, BATCH_SIZE)
+    #
+    # This mirrors evaluate.py + utils.run_scenario_jit.
+    # --------------------------------------------------------
+
+    rng_key = scenario_key
+
+    rng_key, reset_key = (
+        jax.random.split(
+            rng_key
+        )
+    )
+
+    if scenario.shape != ():
+        reset_key = jax.random.split(
+            reset_key,
+            scenario.shape[0],
+        )
+
+    transition = reset_fn(
+        scenario,
+        reset_key,
+    )
+
+    history = [
+        transition.state
+    ]
+
+    # action_history[t] is the action chosen from history[t]
+    # to produce history[t + 1].
+    action_history = []
+
+    while not bool(
+        np.asarray(
+            transition.done
+        ).reshape(-1)[0]
+    ):
+        rng_key, step_key = (
+            jax.random.split(
+                rng_key
+            )
+        )
+
+        transition, rl_transition = step_fn(
+            transition,
+            key=step_key,
+        )
+
+        action_history.append(
+            rl_transition.action
+        )
+
+        history.append(
+            transition.state
+        )
+
+    return history, action_history
+
+
+# ============================================================
+# LOAD RESULTS / GROUPS
+# ============================================================
+
+v26 = (
+    pd.read_csv(
+        V26_EVAL
+    )
+    .set_index(
+        "scenario_index"
+    )
+)
+
+v27 = (
+    pd.read_csv(
+        V27_EVAL
+    )
+    .set_index(
+        "scenario_index"
+    )
+)
+
+pair = pd.read_csv(
+    PAIR_PATH
+)
+
+pair["new_collision"] = as_bool(
+    pair["new_collision"]
+)
+
+pair["fixed_collision"] = as_bool(
+    pair["fixed_collision"]
+)
+
+
+new_collision = sorted(
+    pair.loc[
+        pair[
+            "new_collision"
+        ],
+        "scenario_index",
+    ]
+    .astype(int)
+    .tolist()
+)
+
+fixed_collision = sorted(
+    pair.loc[
+        pair[
+            "fixed_collision"
+        ],
+        "scenario_index",
+    ]
+    .astype(int)
+    .tolist()
+)
+
+
+# ============================================================
+# SAFE CONTROL POOL
+# ============================================================
+
+safe_mask = (
+    (pair["v27_rf"] >= 0.95)
+    & (pair["v27_accuracy"] > 0.5)
+    & (pair["v27_overlap"] <= 0.5)
+    & (pair["v27_offroad"] <= 0.5)
+    & (pair["v27_collision"] <= 0.5)
+)
+
+safe_candidates = (
+    pair.loc[
+        safe_mask,
+        "scenario_index",
+    ]
+    .astype(int)
+    .sort_values()
+    .to_numpy()
+)
+
+num_safe = min(
+    NUM_SAFE,
+    len(
+        safe_candidates
+    ),
+)
+
+safe_pick = np.linspace(
+    0,
+    len(safe_candidates) - 1,
+    num_safe,
+    dtype=int,
+)
+
+safe_controls = (
+    safe_candidates[
+        safe_pick
+    ]
+    .tolist()
+)
+
+
+# ============================================================
+# REFERENCE TIMES
+# ============================================================
+
+reference_step = {}
+group_map = {}
+
+
+# New collision:
+# V27 actual collision termination.
+for idx in new_collision:
+
+    reference_step[idx] = int(
+        v27.loc[
+            idx,
+            "episode_length",
+        ]
+    )
+
+    group_map[idx] = (
+        "NEW_COLLISION"
+    )
+
+
+# Fixed collision:
+# inspect V27 at the time V26 used to collide.
+for idx in fixed_collision:
+
+    reference_step[idx] = int(
+        v26.loc[
+            idx,
+            "episode_length",
+        ]
+    )
+
+    group_map[idx] = (
+        "FIXED_COLLISION"
+    )
+
+
+# Safe:
+# match absolute event-time distribution of NEW collision.
+new_event_steps = [
+    int(
+        v27.loc[
+            idx,
+            "episode_length",
+        ]
+    )
+    for idx in new_collision
+]
+
+for i, idx in enumerate(
+    safe_controls
+):
+
+    reference_step[idx] = (
+        new_event_steps[
+            i
+            % len(
+                new_event_steps
+            )
+        ]
+    )
+
+    group_map[idx] = (
+        "SAFE"
+    )
+
+
+selected = sorted(
+    set(
+        new_collision
+        + fixed_collision
+        + safe_controls
+    )
+)
+
+
+print("=" * 110)
+print("V28 TCPA CALIBRATION")
+print("=" * 110)
+
+print(
+    "NEW_COLLISION  :",
+    len(new_collision),
+)
+
+print(
+    "FIXED_COLLISION:",
+    len(fixed_collision),
+)
+
+print(
+    "SAFE           :",
+    len(safe_controls),
+)
+
+print(
+    "Total replay   :",
+    len(selected),
+)
+
+print(
+    "Leads          :",
+    LEADS,
+)
+
+
+# ============================================================
+# SETUP FROZEN V27
+# ============================================================
+
+env, step_fn, _, _ = (
+    utils.setup_evaluation(
+        policy_type="ai",
+        path_model=MODEL,
+        source_dir="runs",
+        path_dataset=DATASET,
+        eval_name=(
+            "analysis/"
+            "v28_tcpa_tmp"
+        ),
+        max_num_objects=MAX_OBJECTS,
+        noisy_init=False,
+        sdc_paths_from_data=False,
+    )
+)
+
+reset_fn = jax.jit(
+    env.reset
+)
+
+step_fn = jax.jit(
+    step_fn
+)
+
+feature_extractor = (
+    env.get_wrapper_attr(
+        "features_extractor"
+    )
+)
+
+
+data_generator = make_data_generator(
+    path=datasets.get_dataset(
+        DATASET
+    ),
+    max_num_objects=MAX_OBJECTS,
+    include_sdc_paths=False,
+    batch_dims=(
+        BATCH_SIZE,
+        1,
+    ),
+    seed=0,
+    repeat=1,
+)
+
+# Same initial RNG as evaluate.py --seed 0.
+eval_rng_key = (
+    jax.random.PRNGKey(0)
+)
+
+
+
+
+# ============================================================
+# V29 DIRECTIONAL DIAGNOSTIC
+# ============================================================
+
+def directional_snapshot(
+    state,
+    feature_extractor,
+    feat,
+):
+    """
+    Raw geometry for the selected V27 risk object.
+
+    Coordinates are from SDC-local observation space.
+
+    Do NOT yet hard-code LEFT/RIGHT semantics here.
+    We retain signed x/y and compare sign relations first.
+    """
+
+    if getattr(
+        state,
+        "batch_dims",
+        (),
+    ) == (1,):
+        state = jax.tree.map(
+            lambda x: x[0],
+            state,
+        )
+
+    sdc_obs = (
+        feature_extractor
+        ._get_sdc_observation(
+            state
+        )
+    )
+
+    xy = np.asarray(
+        sdc_obs.trajectory.xy[
+            :,
+            -1,
+            :,
+        ],
+        dtype=float,
+    )
+
+    vel = np.asarray(
+        sdc_obs.trajectory.vel_xy[
+            :,
+            -1,
+            :,
+        ],
+        dtype=float,
+    )
+
+    valid = np.asarray(
+        sdc_obs.trajectory.valid[
+            :,
+            -1,
+        ]
+    ).astype(bool)
+
+    dist = np.linalg.norm(
+        xy,
+        axis=-1,
+    )
+
+    valid_dist = np.where(
+        valid,
+        dist,
+        np.inf,
+    )
+
+    ego = int(
+        np.argmin(
+            valid_dist
+        )
+    )
+
+    obj = int(
+        feat[
+            "risk_object_index"
+        ]
+    )
+
+    if (
+        obj < 0
+        or obj >= len(xy)
+        or not valid[obj]
+    ):
+        return None
+
+    r = (
+        xy[obj]
+        - xy[ego]
+    )
+
+    v = (
+        vel[obj]
+        - vel[ego]
+    )
+
+    tcpa = float(
+        feat[
+            "risk_tcpa_clipped"
+        ]
+    )
+
+    closest = (
+        r
+        + tcpa * v
+    )
+
+    return {
+        "risk_relative_x":
+            float(r[0]),
+
+        "risk_relative_y":
+            float(r[1]),
+
+        "risk_relative_vx":
+            float(v[0]),
+
+        "risk_relative_vy":
+            float(v[1]),
+
+        "risk_closest_x":
+            float(closest[0]),
+
+        "risk_closest_y":
+            float(closest[1]),
+    }
+
+
+# ============================================================
+# REPLAY
+# ============================================================
+
+rows = []
+
+done_selected = set()
+
+mismatches = []
+
+global_start = 0
+
+
+for batch in data_generator:
+
+    # --------------------------------------------------------
+    # EXACT evaluate.py batch RNG sequence.
+    #
+    # IMPORTANT:
+    # advance this for EVERY batch, even if the batch contains
+    # no selected diagnostic scenario.
+    # --------------------------------------------------------
+
+    eval_rng_key, batch_scenario_key = (
+        jax.random.split(
+            eval_rng_key
+        )
+    )
+
+    batch_scenario_keys = (
+        jax.random.split(
+            batch_scenario_key,
+            BATCH_SIZE,
+        )
+    )
+
+    batch_end = (
+        global_start
+        + BATCH_SIZE
+    )
+
+    wanted = [
+        idx
+        for idx in selected
+        if (
+            global_start
+            <= idx
+            < batch_end
+            and idx
+            not in done_selected
+        )
+    ]
+
+    for scenario_index in wanted:
+
+        local_idx = (
+            scenario_index
+            - global_start
+        )
+
+        scenario = take_batch_item(
+            batch,
+            local_idx,
+        )
+
+        print(
+            f"[{len(done_selected)+1:03d}/"
+            f"{len(selected):03d}] "
+            f"{group_map[scenario_index]:<16} "
+            f"scenario {scenario_index}",
+            flush=True,
+        )
+
+        history, action_history = rollout(
+            scenario,
+            batch_scenario_keys[
+                local_idx
+            ],
+            reset_fn,
+            step_fn,
+        )
+
+        actual_steps = (
+            len(history)
+            - 1
+        )
+
+        expected_steps = int(
+            v27.loc[
+                scenario_index,
+                "episode_length",
+            ]
+        )
+
+        if actual_steps != expected_steps:
+
+            mismatches.append(
+                (
+                    scenario_index,
+                    expected_steps,
+                    actual_steps,
+                )
+            )
+
+            print(
+                "  WARNING mismatch:",
+                expected_steps,
+                actual_steps,
+            )
+
+            done_selected.add(
+                scenario_index
+            )
+
+            continue
+
+
+        ref = min(
+            int(
+                reference_step[
+                    scenario_index
+                ]
+            ),
+            actual_steps,
+        )
+
+
+        for lead in LEADS:
+
+            lead_steps = int(
+                round(
+                    lead / DT
+                )
+            )
+
+            frame = (
+                ref
+                - lead_steps
+            )
+
+            if (
+                frame < 0
+                or frame >= len(history)
+            ):
+                continue
+
+            feat = interaction_snapshot(
+                history[
+                    frame
+                ],
+                feature_extractor,
+            )
+
+            if feat is None:
+                continue
+
+            dir_feat = directional_snapshot(
+                history[
+                    frame
+                ],
+                feature_extractor,
+                feat,
+            )
+
+            if dir_feat is None:
+                continue
+
+            # ------------------------------------------------
+            # Policy action at this exact pre-event frame.
+            #
+            # action[0] = normalized acceleration
+            # action[1] = normalized steering/curvature
+            # ------------------------------------------------
+
+            if frame >= len(action_history):
+                continue
+
+            action = np.asarray(
+                action_history[frame],
+                dtype=float,
+            ).reshape(-1)
+
+            if action.size < 2:
+                raise RuntimeError(
+                    f"Unexpected action shape: "
+                    f"{np.asarray(action_history[frame]).shape}"
+                )
+
+            action_accel = float(
+                action[0]
+            )
+
+            action_steer = float(
+                action[1]
+            )
+
+            brake_strength = float(
+                max(
+                    -action_accel,
+                    0.0,
+                )
+            )
+
+            throttle_strength = float(
+                max(
+                    action_accel,
+                    0.0,
+                )
+            )
+
+            abs_steer = float(
+                abs(
+                    action_steer
+                )
+            )
+
+
+            # ------------------------------------------------
+            # Action change from previous control cycle.
+            #
+            # V26/V27 temporal regularization thresholds:
+            #   accel = 0.05
+            #   steer = 0.15
+            # ------------------------------------------------
+
+            if frame > 0:
+
+                previous = np.asarray(
+                    action_history[
+                        frame - 1
+                    ],
+                    dtype=float,
+                ).reshape(-1)
+
+                delta_accel = float(
+                    action_accel
+                    - previous[0]
+                )
+
+                delta_steer = float(
+                    action_steer
+                    - previous[1]
+                )
+
+                abs_delta_accel = float(
+                    abs(
+                        delta_accel
+                    )
+                )
+
+                abs_delta_steer = float(
+                    abs(
+                        delta_steer
+                    )
+                )
+
+            else:
+
+                delta_accel = np.nan
+                delta_steer = np.nan
+                abs_delta_accel = np.nan
+                abs_delta_steer = np.nan
+
+
+            accel_change_excess = (
+                max(
+                    abs_delta_accel - 0.05,
+                    0.0,
+                )
+                if np.isfinite(
+                    abs_delta_accel
+                )
+                else np.nan
+            )
+
+            steer_change_excess = (
+                max(
+                    abs_delta_steer - 0.03,
+                    0.0,
+                )
+                if np.isfinite(
+                    abs_delta_steer
+                )
+                else np.nan
+            )
+
+            smooth_excess = (
+                accel_change_excess
+                + steer_change_excess
+                if (
+                    np.isfinite(
+                        accel_change_excess
+                    )
+                    and np.isfinite(
+                        steer_change_excess
+                    )
+                )
+                else np.nan
+            )
+
+
+            rows.append({
+                "scenario_index":
+                    scenario_index,
+
+                "group":
+                    group_map[
+                        scenario_index
+                    ],
+
+                "reference_step":
+                    ref,
+
+                "reference_seconds":
+                    ref * DT,
+
+                "lead_s":
+                    lead,
+
+                "frame":
+                    frame,
+
+                "time_from_start_s":
+                    frame * DT,
+
+                "action_accel":
+                    action_accel,
+
+                "action_steer":
+                    action_steer,
+
+                "brake_strength":
+                    brake_strength,
+
+                "throttle_strength":
+                    throttle_strength,
+
+                "abs_steer":
+                    abs_steer,
+
+                "delta_accel":
+                    delta_accel,
+
+                "delta_steer":
+                    delta_steer,
+
+                "abs_delta_accel":
+                    abs_delta_accel,
+
+                "abs_delta_steer":
+                    abs_delta_steer,
+
+                "accel_change_excess":
+                    accel_change_excess,
+
+                "steer_change_excess":
+                    steer_change_excess,
+
+                "smooth_excess":
+                    smooth_excess,
+
+                **feat,
+                **dir_feat,
+            })
+
+
+        done_selected.add(
+            scenario_index
+        )
+
+
+    global_start = batch_end
+
+    if (
+        len(done_selected)
+        == len(selected)
+    ):
+        break
+
+
+df = pd.DataFrame(
+    rows
+)
+
+df.to_csv(
+    OUT_PATH,
+    index=False,
+)
+
+
+# ============================================================
+# CONSISTENCY
+# ============================================================
+
+print()
+print("=" * 110)
+print("ROLLOUT CONSISTENCY")
+print("=" * 110)
+
+print(
+    "Processed :",
+    len(done_selected),
+)
+
+print(
+    "Mismatches:",
+    len(mismatches),
+)
+
+for m in mismatches:
+    print(
+        " ",
+        m,
+    )
+
+
+# ============================================================
+# STANDARD SUMMARY
+# ============================================================
+
+METRICS = [
+    (
+        "risk_predicted_clearance",
+        False,
+    ),
+    (
+        "risk_static_clearance",
+        False,
+    ),
+    (
+        "risk_future_tcpa",
+        False,
+    ),
+    (
+        "risk_tcpa_clipped",
+        False,
+    ),
+    (
+        "risk_approaching",
+        True,
+    ),
+    (
+        "risk_closing_speed",
+        True,
+    ),
+    (
+        "second_predicted_clearance",
+        False,
+    ),
+    (
+        "top2_mean_predicted_clearance",
+        False,
+    ),
+    (
+        "second_minus_first_pred_gap",
+        False,
+    ),
+    (
+        "second_future_tcpa",
+        False,
+    ),
+    (
+        "num_pred_conflict_0",
+        True,
+    ),
+    (
+        "num_pred_conflict_1",
+        True,
+    ),
+]
+
+
+for lead in LEADS:
+
+    x = df[
+        df[
+            "lead_s"
+        ] == lead
+    ]
+
+    new = x[
+        x["group"]
+        == "NEW_COLLISION"
+    ]
+
+    fixed = x[
+        x["group"]
+        == "FIXED_COLLISION"
+    ]
+
+    safe = x[
+        x["group"]
+        == "SAFE"
+    ]
+
+
+    print()
+    print("=" * 110)
+    print(
+        f"LEAD = {lead:.1f}s"
+    )
+    print("=" * 110)
+
+    print(
+        "Rows:",
+        f"NEW={len(new)}",
+        f"FIXED={len(fixed)}",
+        f"SAFE={len(safe)}",
+    )
+
+    print()
+
+    print(
+        f"{'Metric':<28}"
+        f"{'NEW med':>12}"
+        f"{'FIXED med':>12}"
+        f"{'SAFE med':>12}"
+        f"{'AUC NEW/SAFE':>16}"
+    )
+
+    print(
+        "-" * 84
+    )
+
+    for metric, higher in METRICS:
+
+        auc = auc_pairwise(
+            new[metric],
+            safe[metric],
+            higher_is_risk=higher,
+        )
+
+        print(
+            f"{metric:<28}"
+            f"{new[metric].median():>12.3f}"
+            f"{fixed[metric].median():>12.3f}"
+            f"{safe[metric].median():>12.3f}"
+            f"{auc:>16.3f}"
+        )
+
+
+# ============================================================
+# HARD MATCHING
+#
+# Does TCPA add information after controlling for
+# V27 predicted clearance?
+# ============================================================
+
+def hard_match(
+    positive,
+    negative,
+    use_static=False,
+):
+    """
+    Match each NEW collision scene to the SAFE scene with
+    closest existing V27 geometry.
+
+    Match A:
+      predicted_clearance
+
+    Match B:
+      predicted_clearance + static_clearance
+    """
+
+    if (
+        len(positive) == 0
+        or len(negative) == 0
+    ):
+        return pd.DataFrame()
+
+    neg = (
+        negative
+        .reset_index(
+            drop=True
+        )
+        .copy()
+    )
+
+    matched = []
+
+    # Scales prevent one feature dominating 2D distance.
+    pred_scale = max(
+        float(
+            neg[
+                "risk_predicted_clearance"
+            ].std()
+        ),
+        1e-6,
+    )
+
+    static_scale = max(
+        float(
+            neg[
+                "risk_static_clearance"
+            ].std()
+        ),
+        1e-6,
+    )
+
+
+    for _, p in positive.iterrows():
+
+        d_pred = (
+            (
+                neg[
+                    "risk_predicted_clearance"
+                ]
+                - p[
+                    "risk_predicted_clearance"
+                ]
+            )
+            / pred_scale
+        ) ** 2
+
+
+        distance = d_pred
+
+
+        if use_static:
+
+            d_static = (
+                (
+                    neg[
+                        "risk_static_clearance"
+                    ]
+                    - p[
+                        "risk_static_clearance"
+                    ]
+                )
+                / static_scale
+            ) ** 2
+
+            distance = (
+                distance
+                + d_static
+            )
+
+
+        best_idx = int(
+            distance.idxmin()
+        )
+
+        n = neg.loc[
+            best_idx
+        ]
+
+
+        matched.append({
+            "positive_scenario":
+                int(
+                    p[
+                        "scenario_index"
+                    ]
+                ),
+
+            "control_scenario":
+                int(
+                    n[
+                        "scenario_index"
+                    ]
+                ),
+
+            "pos_pred":
+                float(
+                    p[
+                        "risk_predicted_clearance"
+                    ]
+                ),
+
+            "ctl_pred":
+                float(
+                    n[
+                        "risk_predicted_clearance"
+                    ]
+                ),
+
+            "pred_gap":
+                float(
+                    abs(
+                        p[
+                            "risk_predicted_clearance"
+                        ]
+                        - n[
+                            "risk_predicted_clearance"
+                        ]
+                    )
+                ),
+
+            "pos_static":
+                float(
+                    p[
+                        "risk_static_clearance"
+                    ]
+                ),
+
+            "ctl_static":
+                float(
+                    n[
+                        "risk_static_clearance"
+                    ]
+                ),
+
+            "pos_future_tcpa":
+                float(
+                    p[
+                        "risk_future_tcpa"
+                    ]
+                ),
+
+            "ctl_future_tcpa":
+                float(
+                    n[
+                        "risk_future_tcpa"
+                    ]
+                ),
+
+            "pos_approaching":
+                float(
+                    p[
+                        "risk_approaching"
+                    ]
+                ),
+
+            "ctl_approaching":
+                float(
+                    n[
+                        "risk_approaching"
+                    ]
+                ),
+        })
+
+
+    return pd.DataFrame(
+        matched
+    )
+
+
+print()
+print("=" * 110)
+print("HARD-CONTROL TCPA TEST")
+print("=" * 110)
+
+
+for lead in LEADS:
+
+    x = df[
+        df[
+            "lead_s"
+        ] == lead
+    ]
+
+    new = x[
+        x["group"]
+        == "NEW_COLLISION"
+    ]
+
+    safe = x[
+        x["group"]
+        == "SAFE"
+    ]
+
+
+    print()
+    print(
+        f"----- LEAD {lead:.1f}s -----"
+    )
+
+
+    for label, use_static in [
+        (
+            "MATCH predicted_clearance",
+            False,
+        ),
+        (
+            "MATCH predicted + static",
+            True,
+        ),
+    ]:
+
+        m = hard_match(
+            new,
+            safe,
+            use_static=use_static,
+        )
+
+        if len(m) == 0:
+            continue
+
+
+        auc_tcpa = auc_pairwise(
+            m[
+                "pos_future_tcpa"
+            ],
+            m[
+                "ctl_future_tcpa"
+            ],
+            higher_is_risk=False,
+        )
+
+
+        print()
+        print(label)
+
+        print(
+            "  pairs            :",
+            len(m),
+        )
+
+        print(
+            "  mean |pred gap|  :",
+            f"{m['pred_gap'].mean():.3f}",
+        )
+
+        print(
+            "  NEW TCPA median  :",
+            f"{m['pos_future_tcpa'].median():.3f}",
+        )
+
+        print(
+            "  SAFE TCPA median :",
+            f"{m['ctl_future_tcpa'].median():.3f}",
+        )
+
+        print(
+            "  TCPA AUC         :",
+            f"{auc_tcpa:.3f}",
+        )
+
+        print(
+            "  NEW approaching  :",
+            f"{100*m['pos_approaching'].mean():.1f}%",
+        )
+
+        print(
+            "  SAFE approaching :",
+            f"{100*m['ctl_approaching'].mean():.1f}%",
+        )
+
+
+# ============================================================
+# SECOND-RISK HARD-CONTROL TEST
+#
+# Core question:
+# After matching the geometry of V27's most dangerous object,
+# does geometry of the second-most-dangerous object explain
+# NEW collision vs SAFE / FIXED collision?
+# ============================================================
+
+def match_second_risk(
+    positive,
+    negative,
+    keys,
+):
+    if (
+        len(positive) == 0
+        or len(negative) == 0
+    ):
+        return pd.DataFrame()
+
+    neg = (
+        negative
+        .reset_index(
+            drop=True
+        )
+        .copy()
+    )
+
+    scales = {}
+
+    for key in keys:
+        scales[key] = max(
+            float(
+                neg[key].std()
+            ),
+            1e-6,
+        )
+
+    rows = []
+
+    for _, pos in positive.iterrows():
+
+        distance = np.zeros(
+            len(neg),
+            dtype=float,
+        )
+
+        for key in keys:
+
+            distance += (
+                (
+                    neg[key]
+                    - pos[key]
+                )
+                / scales[key]
+            ) ** 2
+
+
+        best = int(
+            np.argmin(
+                distance
+            )
+        )
+
+        ctl = neg.iloc[
+            best
+        ]
+
+
+        rows.append({
+            "pos_first_pred":
+                pos[
+                    "risk_predicted_clearance"
+                ],
+
+            "ctl_first_pred":
+                ctl[
+                    "risk_predicted_clearance"
+                ],
+
+            "first_pred_gap":
+                abs(
+                    pos[
+                        "risk_predicted_clearance"
+                    ]
+                    - ctl[
+                        "risk_predicted_clearance"
+                    ]
+                ),
+
+            "pos_second_pred":
+                pos[
+                    "second_predicted_clearance"
+                ],
+
+            "ctl_second_pred":
+                ctl[
+                    "second_predicted_clearance"
+                ],
+
+            "pos_top2":
+                pos[
+                    "top2_mean_predicted_clearance"
+                ],
+
+            "ctl_top2":
+                ctl[
+                    "top2_mean_predicted_clearance"
+                ],
+
+            "pos_second_gap":
+                pos[
+                    "second_minus_first_pred_gap"
+                ],
+
+            "ctl_second_gap":
+                ctl[
+                    "second_minus_first_pred_gap"
+                ],
+
+            "pos_second_tcpa":
+                pos[
+                    "second_future_tcpa"
+                ],
+
+            "ctl_second_tcpa":
+                ctl[
+                    "second_future_tcpa"
+                ],
+        })
+
+
+    return pd.DataFrame(
+        rows
+    )
+
+
+print()
+print("=" * 110)
+print("SECOND-RISK HARD-CONTROL TEST")
+print("=" * 110)
+
+
+for lead in LEADS:
+
+    x = df[
+        df[
+            "lead_s"
+        ] == lead
+    ]
+
+    new = x[
+        x["group"]
+        == "NEW_COLLISION"
+    ]
+
+    safe = x[
+        x["group"]
+        == "SAFE"
+    ]
+
+    fixed = x[
+        x["group"]
+        == "FIXED_COLLISION"
+    ]
+
+
+    print()
+    print(
+        f"----- LEAD {lead:.1f}s -----"
+    )
+
+
+    for label, keys in [
+
+        (
+            "MATCH first predicted",
+            [
+                "risk_predicted_clearance",
+            ],
+        ),
+
+        (
+            "MATCH first predicted + static",
+            [
+                "risk_predicted_clearance",
+                "risk_static_clearance",
+            ],
+        ),
+
+    ]:
+
+        print()
+        print(label)
+
+
+        # ----------------------------------------------------
+        # NEW vs SAFE
+        # ----------------------------------------------------
+
+        ms = match_second_risk(
+            new,
+            safe,
+            keys,
+        )
+
+
+        # ----------------------------------------------------
+        # NEW vs FIXED
+        # ----------------------------------------------------
+
+        mf = match_second_risk(
+            new,
+            fixed,
+            keys,
+        )
+
+
+        if (
+            len(ms) == 0
+            or len(mf) == 0
+        ):
+            continue
+
+
+        auc_second_safe = auc_pairwise(
+            ms[
+                "pos_second_pred"
+            ],
+            ms[
+                "ctl_second_pred"
+            ],
+            higher_is_risk=False,
+        )
+
+        auc_second_fixed = auc_pairwise(
+            mf[
+                "pos_second_pred"
+            ],
+            mf[
+                "ctl_second_pred"
+            ],
+            higher_is_risk=False,
+        )
+
+
+        auc_top2_safe = auc_pairwise(
+            ms[
+                "pos_top2"
+            ],
+            ms[
+                "ctl_top2"
+            ],
+            higher_is_risk=False,
+        )
+
+        auc_top2_fixed = auc_pairwise(
+            mf[
+                "pos_top2"
+            ],
+            mf[
+                "ctl_top2"
+            ],
+            higher_is_risk=False,
+        )
+
+
+        auc_gap_safe = auc_pairwise(
+            ms[
+                "pos_second_gap"
+            ],
+            ms[
+                "ctl_second_gap"
+            ],
+            higher_is_risk=False,
+        )
+
+        auc_gap_fixed = auc_pairwise(
+            mf[
+                "pos_second_gap"
+            ],
+            mf[
+                "ctl_second_gap"
+            ],
+            higher_is_risk=False,
+        )
+
+
+        auc_tcpa_safe = auc_pairwise(
+            ms[
+                "pos_second_tcpa"
+            ],
+            ms[
+                "ctl_second_tcpa"
+            ],
+            higher_is_risk=False,
+        )
+
+        auc_tcpa_fixed = auc_pairwise(
+            mf[
+                "pos_second_tcpa"
+            ],
+            mf[
+                "ctl_second_tcpa"
+            ],
+            higher_is_risk=False,
+        )
+
+
+        print(
+            "  mean |first pred gap| SAFE :",
+            f"{ms['first_pred_gap'].mean():.3f}",
+        )
+
+        print(
+            "  mean |first pred gap| FIXED:",
+            f"{mf['first_pred_gap'].mean():.3f}",
+        )
+
+        print()
+
+        print(
+            "  second_pred AUC NEW/SAFE :",
+            f"{auc_second_safe:.3f}",
+        )
+
+        print(
+            "  second_pred AUC NEW/FIXED:",
+            f"{auc_second_fixed:.3f}",
+        )
+
+        print(
+            "  top2_mean   AUC NEW/SAFE :",
+            f"{auc_top2_safe:.3f}",
+        )
+
+        print(
+            "  top2_mean   AUC NEW/FIXED:",
+            f"{auc_top2_fixed:.3f}",
+        )
+
+        print(
+            "  second_gap  AUC NEW/SAFE :",
+            f"{auc_gap_safe:.3f}",
+        )
+
+        print(
+            "  second_gap  AUC NEW/FIXED:",
+            f"{auc_gap_fixed:.3f}",
+        )
+
+        print(
+            "  second_TCPA AUC NEW/SAFE :",
+            f"{auc_tcpa_safe:.3f}",
+        )
+
+        print(
+            "  second_TCPA AUC NEW/FIXED:",
+            f"{auc_tcpa_fixed:.3f}",
+        )
+
+        print()
+
+        print(
+            "  NEW second_pred median   :",
+            f"{ms['pos_second_pred'].median():.3f}",
+        )
+
+        print(
+            "  SAFE second_pred median  :",
+            f"{ms['ctl_second_pred'].median():.3f}",
+        )
+
+        print(
+            "  FIXED second_pred median :",
+            f"{mf['ctl_second_pred'].median():.3f}",
+        )
+
+
+# ============================================================
+# ACTION RESPONSE ANALYSIS
+# ============================================================
+
+ACTION_METRICS = [
+    "action_accel",
+    "brake_strength",
+    "throttle_strength",
+    "abs_steer",
+    "abs_delta_accel",
+    "abs_delta_steer",
+    "accel_change_excess",
+    "steer_change_excess",
+    "smooth_excess",
+]
+
+
+def separability_auc(
+    pos,
+    neg,
+):
+    """
+    Direction-free separability.
+
+    0.50 = same distribution
+    1.00 = perfectly separated
+    """
+
+    auc = auc_pairwise(
+        pos,
+        neg,
+        higher_is_risk=True,
+    )
+
+    if not np.isfinite(auc):
+        return np.nan
+
+    return float(
+        max(
+            auc,
+            1.0 - auc,
+        )
+    )
+
+
+def match_action_controls(
+    positive,
+    negative,
+    keys,
+):
+    if (
+        len(positive) == 0
+        or len(negative) == 0
+    ):
+        return pd.DataFrame()
+
+    neg = (
+        negative
+        .reset_index(
+            drop=True
+        )
+        .copy()
+    )
+
+    scales = {}
+
+    for key in keys:
+
+        scales[key] = max(
+            float(
+                neg[
+                    key
+                ].std()
+            ),
+            1e-6,
+        )
+
+
+    rows = []
+
+    for _, pos in positive.iterrows():
+
+        distance = np.zeros(
+            len(neg),
+            dtype=float,
+        )
+
+        for key in keys:
+
+            distance += (
+                (
+                    neg[key]
+                    - pos[key]
+                )
+                / scales[key]
+            ) ** 2
+
+
+        best = int(
+            np.argmin(
+                distance
+            )
+        )
+
+        ctl = neg.iloc[
+            best
+        ]
+
+
+        row = {
+            "positive_scenario":
+                int(
+                    pos[
+                        "scenario_index"
+                    ]
+                ),
+
+            "control_scenario":
+                int(
+                    ctl[
+                        "scenario_index"
+                    ]
+                ),
+
+            "first_pred_gap":
+                abs(
+                    pos[
+                        "risk_predicted_clearance"
+                    ]
+                    - ctl[
+                        "risk_predicted_clearance"
+                    ]
+                ),
+
+            "static_gap":
+                abs(
+                    pos[
+                        "risk_static_clearance"
+                    ]
+                    - ctl[
+                        "risk_static_clearance"
+                    ]
+                ),
+
+            "second_pred_gap":
+                abs(
+                    pos[
+                        "second_predicted_clearance"
+                    ]
+                    - ctl[
+                        "second_predicted_clearance"
+                    ]
+                ),
+        }
+
+
+        for metric in ACTION_METRICS:
+
+            row[
+                "pos_" + metric
+            ] = pos[
+                metric
+            ]
+
+            row[
+                "ctl_" + metric
+            ] = ctl[
+                metric
+            ]
+
+
+        rows.append(
+            row
+        )
+
+
+    return pd.DataFrame(
+        rows
+    )
+
+
+print()
+print("=" * 110)
+print("ACTION RESPONSE ANALYSIS")
+print("=" * 110)
+
+
+for lead in LEADS:
+
+    x = df[
+        df[
+            "lead_s"
+        ] == lead
+    ]
+
+    new = x[
+        x["group"]
+        == "NEW_COLLISION"
+    ]
+
+    fixed = x[
+        x["group"]
+        == "FIXED_COLLISION"
+    ]
+
+    safe = x[
+        x["group"]
+        == "SAFE"
+    ]
+
+
+    print()
+    print("=" * 110)
+    print(
+        f"LEAD {lead:.1f}s"
+    )
+    print("=" * 110)
+
+    print(
+        "Rows:",
+        f"NEW={len(new)}",
+        f"FIXED={len(fixed)}",
+        f"SAFE={len(safe)}",
+    )
+
+
+    # --------------------------------------------------------
+    # Raw behavior
+    # --------------------------------------------------------
+
+    print()
+    print("RAW ACTION MEDIANS")
+
+    print(
+        f"{'Metric':<24}"
+        f"{'NEW':>12}"
+        f"{'FIXED':>12}"
+        f"{'SAFE':>12}"
+        f"{'Sep NEW/FIXED':>17}"
+    )
+
+    print("-" * 80)
+
+
+    for metric in ACTION_METRICS:
+
+        sep = separability_auc(
+            new[
+                metric
+            ],
+            fixed[
+                metric
+            ],
+        )
+
+        print(
+            f"{metric:<24}"
+            f"{new[metric].median():>12.3f}"
+            f"{fixed[metric].median():>12.3f}"
+            f"{safe[metric].median():>12.3f}"
+            f"{sep:>17.3f}"
+        )
+
+
+    # --------------------------------------------------------
+    # Geometry-matched NEW vs FIXED.
+    # --------------------------------------------------------
+
+    for label, keys in [
+
+        (
+            "MATCH first predicted + static",
+            [
+                "risk_predicted_clearance",
+                "risk_static_clearance",
+            ],
+        ),
+
+        (
+            "MATCH first + static + second",
+            [
+                "risk_predicted_clearance",
+                "risk_static_clearance",
+                "second_predicted_clearance",
+            ],
+        ),
+
+    ]:
+
+        m = match_action_controls(
+            new,
+            fixed,
+            keys,
+        )
+
+        print()
+        print(label)
+
+        if len(m) == 0:
+            print(
+                "  no pairs"
+            )
+            continue
+
+
+        print(
+            "  pairs                   :",
+            len(m),
+        )
+
+        print(
+            "  mean first_pred gap     :",
+            f"{m['first_pred_gap'].mean():.3f}",
+        )
+
+        print(
+            "  mean static gap         :",
+            f"{m['static_gap'].mean():.3f}",
+        )
+
+        print(
+            "  mean second_pred gap    :",
+            f"{m['second_pred_gap'].mean():.3f}",
+        )
+
+        print()
+
+        print(
+            f"{'Metric':<24}"
+            f"{'NEW med':>12}"
+            f"{'FIXED med':>12}"
+            f"{'NEW-FIXED':>14}"
+            f"{'Separability':>15}"
+        )
+
+        print("-" * 80)
+
+
+        for metric in ACTION_METRICS:
+
+            pos = m[
+                "pos_" + metric
+            ]
+
+            ctl = m[
+                "ctl_" + metric
+            ]
+
+            diff = (
+                pos
+                - ctl
+            )
+
+            sep = separability_auc(
+                pos,
+                ctl,
+            )
+
+            print(
+                f"{metric:<24}"
+                f"{pos.median():>12.3f}"
+                f"{ctl.median():>12.3f}"
+                f"{diff.mean():>14.3f}"
+                f"{sep:>15.3f}"
+            )
+
+
+        # Explicit interpretation helpers.
+        accel_diff = (
+            m[
+                "pos_action_accel"
+            ]
+            - m[
+                "ctl_action_accel"
+            ]
+        )
+
+        brake_diff = (
+            m[
+                "pos_brake_strength"
+            ]
+            - m[
+                "ctl_brake_strength"
+            ]
+        )
+
+        steer_diff = (
+            m[
+                "pos_abs_steer"
+            ]
+            - m[
+                "ctl_abs_steer"
+            ]
+        )
+
+        delta_steer_diff = (
+            m[
+                "pos_abs_delta_steer"
+            ]
+            - m[
+                "ctl_abs_delta_steer"
+            ]
+        )
+
+
+        print()
+
+        print(
+            "  P(NEW more accel / less brake):",
+            f"{100*(accel_diff > 0).mean():.1f}%",
+        )
+
+        print(
+            "  P(NEW stronger braking)       :",
+            f"{100*(brake_diff > 0).mean():.1f}%",
+        )
+
+        print(
+            "  P(NEW larger |steer|)         :",
+            f"{100*(steer_diff > 0).mean():.1f}%",
+        )
+
+        print(
+            "  P(NEW larger steering change) :",
+            f"{100*(delta_steer_diff > 0).mean():.1f}%",
+        )
+
+
+# ============================================================
+# TCPA THRESHOLDS
+# ============================================================
+
+print()
+print("=" * 110)
+print("FUTURE TCPA THRESHOLDS")
+print("=" * 110)
+
+
+for lead in LEADS:
+
+    x = df[
+        df[
+            "lead_s"
+        ] == lead
+    ]
+
+    new = x[
+        x["group"]
+        == "NEW_COLLISION"
+    ]
+
+    safe = x[
+        x["group"]
+        == "SAFE"
+    ]
+
+    print()
+    print(
+        f"Lead {lead:.1f}s"
+    )
+
+    for threshold in [
+        0.5,
+        1.0,
+        2.0,
+        3.0,
+    ]:
+
+        new_rate = (
+            new[
+                "risk_future_tcpa"
+            ]
+            <= threshold
+        ).mean()
+
+        safe_rate = (
+            safe[
+                "risk_future_tcpa"
+            ]
+            <= threshold
+        ).mean()
+
+        print(
+            f"  TCPA <= {threshold:3.1f}s"
+            f"   NEW={100*new_rate:6.1f}%"
+            f"   SAFE={100*safe_rate:6.1f}%"
+        )
+
+
+print()
+print("=" * 110)
+print("SAVED")
+print("=" * 110)
+
+print(
+    OUT_PATH
+)

@@ -24,6 +24,12 @@ class ObjectFeatures:
     yaw: jax.Array = field(default_factory=lambda: jnp.array(()))  # Yaw angles over time
     length: jax.Array = field(default_factory=lambda: jnp.array(()))  # Object lengths
     width: jax.Array = field(default_factory=lambda: jnp.array(()))  # Object widths
+    static_clearance: jax.Array = field(
+        default_factory=lambda: jnp.array(())
+    )  # Current circle-geometry clearance to ego
+    predicted_clearance: jax.Array = field(
+        default_factory=lambda: jnp.array(())
+    )  # Constant-velocity closest-approach clearance to ego
     object_types: jax.Array = field(default_factory=lambda: jnp.array(()))  # Object types
     valid: jax.Array = field(default_factory=lambda: jnp.array(()))  # Validity mask over time
 

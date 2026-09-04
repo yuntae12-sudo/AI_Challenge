@@ -10,6 +10,7 @@ from waymax.env.planning_agent_environment import PlanningAgentEnvironment
 from waymax.utils import geometry as waymax_geometry
 
 from vmax.simulator import metrics, operations
+from vmax.simulator.metrics.offroad_in_box import is_sdc_offroad_in_box
 from vmax.simulator.wrappers.base import Wrapper
 
 
@@ -84,9 +85,12 @@ def _get_reward_fn(reward_name: str) -> callable:
         "proximity": _compute_proximity_reward,
         "offroad": _compute_offroad_reward,
         "offroad_in_box": _compute_offroad_in_box_reward,
+        "offroad_in_box_warn": _compute_offroad_in_box_warn_reward,
         "off_route": _compute_off_route_reward,
         "below_ttc": _compute_below_ttc_reward,
         "below_ttc_all": _compute_below_ttc_all_reward,
+        "at_fault_collision": _compute_at_fault_collision_reward,
+        "ttc_risk_all": _compute_ttc_risk_all_reward,
         "red_light": _compute_red_light_reward,
         "comfort": _compute_comfort_reward,
         "overspeed": _compute_overspeed_limit_reward,
@@ -201,6 +205,42 @@ def _compute_offroad_in_box_reward(state: datatypes.SimulatorState) -> bool:
     return offroad == 1.0
 
 
+
+def _compute_offroad_in_box_warn_reward(
+    state: datatypes.SimulatorState,
+) -> bool:
+    """Warn shortly before offroad_in_box termination.
+
+    Warning zone:
+      - road edge is inside the actual SDC footprint (margin=0.0)
+      - but NOT yet inside the shrunken termination footprint
+        (margin=-0.3)
+
+    This creates a narrow ~0.3 m pre-termination shaping band
+    without changing the termination definition itself.
+    """
+    outer_contact = (
+        is_sdc_offroad_in_box(
+            state,
+            margin=0.0,
+        )
+        == 1.0
+    )
+
+    terminated_offroad = (
+        is_sdc_offroad_in_box(
+            state,
+            margin=-0.3,
+        )
+        == 1.0
+    )
+
+    return jnp.logical_and(
+        outer_contact,
+        jnp.logical_not(terminated_offroad),
+    )
+
+
 def _compute_red_light_reward(state: datatypes.SimulatorState) -> bool:
     """Compute a reward penalizing red light violations.
 
@@ -288,6 +328,77 @@ def _compute_below_ttc_all_reward(
     min_ttc_all = jnp.min(ttc)
 
     return min_ttc_all < threshold
+
+
+
+def _compute_ttc_risk_all_reward(
+    state: datatypes.SimulatorState,
+    safe_threshold: float = 2.5,
+    critical_threshold: float = 1.5,
+) -> float:
+    """Continuous all-direction TTC risk.
+
+    Risk:
+      TTC >= 2.5 s -> 0.0
+      TTC  = 2.0 s -> 0.5
+      TTC <= 1.5 s -> 1.0
+
+    Keeps the previous full penalty in the critical TTC region,
+    while introducing an earlier graded warning signal.
+    """
+    current_traj = datatypes.dynamic_slice(
+        state.sim_trajectory,
+        state.timestep,
+        1,
+        -1,
+    )
+
+    sdc_idx = operations.get_index(
+        state.object_metadata.is_sdc
+    )
+
+    ttc_metric = metrics.TimeToCollisionMetric()
+
+    ttc, _ = ttc_metric._compute_ttc(
+        current_traj,
+        sdc_idx,
+        dt=0.1,
+        time_horizon=5.0,
+    )
+
+    min_ttc_all = jnp.min(ttc)
+
+    risk = (
+        safe_threshold - min_ttc_all
+    ) / (
+        safe_threshold - critical_threshold
+    )
+
+    return jnp.clip(risk, 0.0, 1.0)
+
+
+
+def _compute_at_fault_collision_reward(
+    state: datatypes.SimulatorState,
+) -> float:
+    """Binary penalty for an ego-at-fault collision.
+
+    AtFaultCollisionMetric can be greater than 1 when multiple
+    at-fault collisions are detected at the same timestep.
+    Clamp the metric to [0, 1] so the reward strength does not
+    depend on the number of simultaneously colliding objects.
+    """
+    at_fault = (
+        metrics.AtFaultCollisionMetric()
+        .compute(state)
+        .value
+    )
+
+    return jnp.clip(
+        at_fault,
+        0.0,
+        1.0,
+    )
 
 
 def _compute_off_route_reward(state: datatypes.SimulatorState) -> bool:

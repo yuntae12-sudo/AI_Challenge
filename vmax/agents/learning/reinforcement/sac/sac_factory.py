@@ -180,7 +180,13 @@ def make_networks(
 
 
 def make_sgd_step(
-    sac_network: SACNetworks, alpha: float, discount: float, tau: float
+    sac_network: SACNetworks,
+    alpha: float,
+    discount: float,
+    tau: float,
+    smoothness_lambda: float = 0.0,
+    smoothness_accel_threshold: float = 0.05,
+    smoothness_steer_threshold: float = 0.03,
 ) -> datatypes.LearningFunction:
     """Create the SGD step function for SAC.
 
@@ -195,11 +201,19 @@ def make_sgd_step(
 
     """
     value_loss, policy_loss = _make_loss_fn(
-        sac_network=sac_network, alpha=alpha, discount=discount
+        sac_network=sac_network,
+        alpha=alpha,
+        discount=discount,
+        smoothness_lambda=smoothness_lambda,
+        smoothness_accel_threshold=smoothness_accel_threshold,
+        smoothness_steer_threshold=smoothness_steer_threshold,
     )
 
     policy_update = networks.gradient_update_fn(
-        policy_loss, sac_network.policy_optimizer, pmap_axis_name="batch"
+        policy_loss,
+        sac_network.policy_optimizer,
+        pmap_axis_name="batch",
+        has_aux=True,
     )
     value_update = networks.gradient_update_fn(
         value_loss, sac_network.value_optimizer, pmap_axis_name="batch"
@@ -221,7 +235,11 @@ def make_sgd_step(
             key_value,
             optimizer_state=training_state.value_optimizer_state,
         )
-        policy_loss, policy_params, policy_optimizer_state = policy_update(
+        (
+            (policy_loss, policy_aux),
+            policy_params,
+            policy_optimizer_state,
+        ) = policy_update(
             training_state.params.policy,
             training_state.params.value,
             transitions,
@@ -235,7 +253,11 @@ def make_sgd_step(
             value_params,
         )
 
-        sgd_metrics = {"policy_loss": policy_loss, "value_loss": value_loss}
+        sgd_metrics = {
+            "policy_loss": policy_loss,
+            "value_loss": value_loss,
+            **policy_aux,
+        }
 
         params = SACNetworkParams(
             policy=policy_params,
@@ -256,7 +278,12 @@ def make_sgd_step(
 
 
 def _make_loss_fn(
-    sac_network: SACNetworks, alpha: float, discount: float
+    sac_network: SACNetworks,
+    alpha: float,
+    discount: float,
+    smoothness_lambda: float = 0.0,
+    smoothness_accel_threshold: float = 0.05,
+    smoothness_steer_threshold: float = 0.03,
 ) -> tuple[callable, callable]:
     """Define the loss functions for SAC.
 
@@ -309,17 +336,161 @@ def _make_loss_fn(
         value_params: datatypes.Params,
         transitions: datatypes.RLTransition,
         key: jax.Array,
-    ) -> jax.Array:
-        dist_params = policy_network.apply(policy_params, transitions.observation)
+    ):
+        # ----------------------------------------------------
+        # Original SAC actor objective.
+        # ----------------------------------------------------
+        dist_params = policy_network.apply(
+            policy_params,
+            transitions.observation,
+        )
 
-        action = parametric_action_distribution.sample_no_postprocessing(dist_params, key)
-        log_prob = parametric_action_distribution.log_prob(dist_params, action)
-        action = parametric_action_distribution.postprocess(action)
+        raw_action = (
+            parametric_action_distribution
+            .sample_no_postprocessing(
+                dist_params,
+                key,
+            )
+        )
 
-        value_action = value_network.apply(value_params, transitions.observation, action)
-        min_value = jnp.min(value_action, axis=-1)
-        policy_loss = alpha * log_prob - min_value
+        log_prob = (
+            parametric_action_distribution
+            .log_prob(
+                dist_params,
+                raw_action,
+            )
+        )
 
-        return jnp.mean(policy_loss)
+        action = (
+            parametric_action_distribution
+            .postprocess(
+                raw_action
+            )
+        )
+
+        value_action = value_network.apply(
+            value_params,
+            transitions.observation,
+            action,
+        )
+
+        min_value = jnp.min(
+            value_action,
+            axis=-1,
+        )
+
+        base_policy_loss = jnp.mean(
+            alpha * log_prob
+            - min_value
+        )
+
+        # ----------------------------------------------------
+        # V26 Temporal Action Consistency.
+        #
+        # Use deterministic policy modes instead of sampled
+        # actions so SAC exploration entropy is not directly
+        # suppressed.
+        #
+        # action[..., 0] = normalized acceleration
+        # action[..., 1] = normalized steering curvature
+        # ----------------------------------------------------
+        current_mode = (
+            parametric_action_distribution
+            .mode(
+                dist_params
+            )
+        )
+
+        next_dist_params = policy_network.apply(
+            policy_params,
+            transitions.next_observation,
+        )
+
+        next_mode = (
+            parametric_action_distribution
+            .mode(
+                next_dist_params
+            )
+        )
+
+        delta_action = (
+            next_mode
+            - current_mode
+        )
+
+        accel_excess = jax.nn.relu(
+            jnp.abs(
+                delta_action[..., 0]
+            )
+            - smoothness_accel_threshold
+        )
+
+        steer_excess = jax.nn.relu(
+            jnp.abs(
+                delta_action[..., 1]
+            )
+            - smoothness_steer_threshold
+        )
+
+        # Do not regularize across terminal transitions.
+        valid = jnp.asarray(
+            transitions.flag,
+            dtype=jnp.float32,
+        )
+
+        valid_count = jnp.maximum(
+            jnp.sum(valid),
+            1.0,
+        )
+
+        smoothness_accel = (
+            jnp.sum(
+                jnp.square(accel_excess)
+                * valid
+            )
+            / valid_count
+        )
+
+        smoothness_steer = (
+            jnp.sum(
+                jnp.square(steer_excess)
+                * valid
+            )
+            / valid_count
+        )
+
+        raw_smoothness_loss = (
+            smoothness_accel
+            + smoothness_steer
+        )
+
+        smoothness_loss = (
+            smoothness_lambda
+            * raw_smoothness_loss
+        )
+
+        total_policy_loss = (
+            base_policy_loss
+            + smoothness_loss
+        )
+
+        aux = {
+            "policy_base_loss":
+                base_policy_loss,
+
+            "smoothness_loss":
+                smoothness_loss,
+
+            "smoothness_raw":
+                raw_smoothness_loss,
+
+            "smoothness_accel":
+                smoothness_accel,
+
+            "smoothness_steer":
+                smoothness_steer,
+        }
+
+        return total_policy_loss, aux
 
     return compute_value_loss, compute_policy_loss

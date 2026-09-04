@@ -15,3 +15,7 @@ ff_mult: 2
 attn_dropout: 0.0
 ff_dropout: 0.0
 tie_layer_weights: true
+
+# Object positional encoding.
+# true = legacy/default slot-specific PE.
+use_object_rank_pe: true

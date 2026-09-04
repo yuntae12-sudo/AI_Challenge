@@ -8,6 +8,13 @@ learning_rate: 3e-4
 discount: 0.99
 tau: 0.005
 alpha: 0.2
+
+# V26 temporal action consistency.
+# lambda=0.0 preserves the original SAC behavior.
+smoothness_lambda: 0.0
+smoothness_accel_threshold: 0.05
+smoothness_steer_threshold: 0.15
+
 batch_size: 64
 grad_updates_per_step: 4
 buffer_size: 100_000

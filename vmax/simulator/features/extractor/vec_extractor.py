@@ -24,6 +24,8 @@ FEATURE_MAP = {
     "types": ("types",),
     "state": ("state",),
     "object_types": ("object_types",),
+    "static_clearance": ("static_clearance",),
+    "predicted_clearance": ("predicted_clearance",),
 }
 
 
@@ -390,53 +392,260 @@ class VecFeaturesExtractor(extractor.AbstractFeaturesExtractor):
         # 4. Plot path target
         path_target_features.plot(ax)
 
-    def _build_objects_features(self, sdc_obs: datatypes.Observation) -> features.ObjectFeatures:
+    def _build_objects_features(
+        self,
+        sdc_obs: datatypes.Observation,
+    ) -> features.ObjectFeatures:
         """Create features for dynamic objects.
 
-        The objects are selected based on the closest distance to the SDC.
+        Objects are still selected strictly by current Euclidean distance.
+        V27 additionally exposes two geometry-aware interaction signals:
 
-        Args:
-            sdc_obs: The SDC observation.
+        - static_clearance:
+          current center distance minus ego/object bounding-circle radii.
 
-        Returns:
-            An instance of ObjectFeatures.
+        - predicted_clearance:
+          constant-velocity closest-approach distance minus the same radii.
+
+        Negative clearance indicates geometric conflict under the
+        corresponding circle approximation.
         """
-        object_features = features.ObjectFeatures(field_names=self._object_features_key)
+        object_features = features.ObjectFeatures(
+            field_names=self._object_features_key
+        )
 
         if not self._object_features_key:
             return object_features
 
-        # Calculate distances and find closest objects
-        distances_ego_objects = jnp.linalg.norm(sdc_obs.trajectory.xy[:, -1, :], axis=-1)
-        distances_ego_valid_objects = jnp.where(
-            sdc_obs.trajectory.valid[:, -1], distances_ego_objects, jnp.inf
+        # ----------------------------------------------------
+        # Keep V26 object-selection behavior unchanged.
+        # ----------------------------------------------------
+
+        distances_ego_objects = jnp.linalg.norm(
+            sdc_obs.trajectory.xy[:, -1, :],
+            axis=-1,
         )
 
-        # Get indices of closest objects
+        distances_ego_valid_objects = jnp.where(
+            sdc_obs.trajectory.valid[:, -1],
+            distances_ego_objects,
+            jnp.inf,
+        )
+
         closest_object_idxs = operations.get_index(
             -distances_ego_valid_objects,
             k=self._num_closest_objects + 1,
             squeeze=False,
         )
 
-        object_features = features.ObjectFeatures(field_names=self._object_features_key)
-        for key in self._object_features_key:
-            feature = (
-                getattr(sdc_obs.metadata, key)
-                if key == "object_types"
-                else getattr(sdc_obs.trajectory, key)
+        # ----------------------------------------------------
+        # Geometry-aware features for selected objects.
+        #
+        # Shape:
+        #   xy / vel: (objects, history, 2)
+        #   scalar:   (objects, history)
+        #
+        # closest_object_idxs[0] is the SDC, consistent with
+        # the existing downstream assumption.
+        # ----------------------------------------------------
+
+        selected_xy = (
+            sdc_obs.trajectory.xy[
+                closest_object_idxs
+            ]
+        )
+
+        selected_vel = (
+            sdc_obs.trajectory.vel_xy[
+                closest_object_idxs
+            ]
+        )
+
+        selected_length = (
+            sdc_obs.trajectory.length[
+                closest_object_idxs
+            ]
+        )
+
+        selected_width = (
+            sdc_obs.trajectory.width[
+                closest_object_idxs
+            ]
+        )
+
+        selected_valid = (
+            sdc_obs.trajectory.valid[
+                closest_object_idxs
+            ]
+        )
+
+        # Waymax scalar trajectory fields can be (..., T)
+        # or (..., T, 1); canonicalize to (..., T).
+        if selected_length.ndim == selected_xy.ndim:
+            selected_length = selected_length[..., 0]
+
+        if selected_width.ndim == selected_xy.ndim:
+            selected_width = selected_width[..., 0]
+
+        if selected_valid.ndim == selected_xy.ndim:
+            selected_valid = selected_valid[..., 0]
+
+        ego_xy = selected_xy[0:1]
+        ego_vel = selected_vel[0:1]
+
+        relative_xy = (
+            selected_xy
+            - ego_xy
+        )
+
+        relative_vel = (
+            selected_vel
+            - ego_vel
+        )
+
+        center_distance = jnp.linalg.norm(
+            relative_xy,
+            axis=-1,
+        )
+
+        object_radius = (
+            0.5
+            * jnp.sqrt(
+                selected_length**2
+                + selected_width**2
             )
-            feature = feature[closest_object_idxs]
+        )
+
+        ego_radius = object_radius[0:1]
+
+        static_clearance = (
+            center_distance
+            - ego_radius
+            - object_radius
+        )
+
+        # ----------------------------------------------------
+        # Constant-velocity closest approach.
+        # Horizon = 5 seconds.
+        #
+        # t* = -(r dot v) / ||v||^2
+        # ----------------------------------------------------
+
+        relative_speed_sq = jnp.sum(
+            relative_vel**2,
+            axis=-1,
+        )
+
+        position_velocity_dot = jnp.sum(
+            relative_xy
+            * relative_vel,
+            axis=-1,
+        )
+
+        tcpa_raw = jnp.where(
+            relative_speed_sq > 1e-6,
+            -position_velocity_dot
+            / relative_speed_sq,
+            0.0,
+        )
+
+        tcpa = jnp.clip(
+            tcpa_raw,
+            0.0,
+            5.0,
+        )
+
+        closest_relative_xy = (
+            relative_xy
+            + tcpa[..., None]
+            * relative_vel
+        )
+
+        dcpa = jnp.linalg.norm(
+            closest_relative_xy,
+            axis=-1,
+        )
+
+        predicted_clearance = (
+            dcpa
+            - ego_radius
+            - object_radius
+        )
+
+        pair_valid = (
+            selected_valid
+            & selected_valid[0:1]
+        )
+
+        static_clearance = jnp.where(
+            pair_valid,
+            static_clearance,
+            0.0,
+        )
+
+        predicted_clearance = jnp.where(
+            pair_valid,
+            predicted_clearance,
+            0.0,
+        )
+
+        custom_features = {
+            "static_clearance":
+                static_clearance[..., None],
+            "predicted_clearance":
+                predicted_clearance[..., None],
+        }
+
+        # ----------------------------------------------------
+        # Build final object tensor.
+        # ----------------------------------------------------
+
+        object_features = features.ObjectFeatures(
+            field_names=self._object_features_key
+        )
+
+        for key in self._object_features_key:
+            if key in custom_features:
+                feature = custom_features[key]
+
+            else:
+                feature = (
+                    getattr(
+                        sdc_obs.metadata,
+                        key,
+                    )
+                    if key == "object_types"
+                    else getattr(
+                        sdc_obs.trajectory,
+                        key,
+                    )
+                )
+
+                feature = feature[
+                    closest_object_idxs
+                ]
+
             feature = extractor.normalize_by_feature(
-                feature, key, self._max_meters, self._dict_mapping
+                feature,
+                key,
+                self._max_meters,
+                self._dict_mapping,
             )
 
             if feature.ndim == 2:
-                feature = jnp.expand_dims(feature, axis=-1)
+                feature = jnp.expand_dims(
+                    feature,
+                    axis=-1,
+                )
 
-            setattr(object_features, key, feature)
+            setattr(
+                object_features,
+                key,
+                feature,
+            )
 
         return object_features
+
 
     def _build_roadgraph_features(
         self, sdc_obs: datatypes.Observation
@@ -520,41 +729,90 @@ class VecFeaturesExtractor(extractor.AbstractFeaturesExtractor):
         return traffic_light_features
 
     def _build_expert_target_features(
-        self, sdc_obs: datatypes.Observation, state: datatypes.SimulatorState
+        self,
+        sdc_obs: datatypes.Observation,
+        state: datatypes.SimulatorState,
     ) -> features.PathTargetFeatures:
-        """Build path target features from the SDC's logged goal endpoint.
+        """Build hybrid near-term + long-term route guidance.
 
-        Roadgraph-independent: instead of sampling along a roadgraph-derived
-        sdc_path (unreliable for some datasets, e.g. rideflux), the target is a
-        single goal point: the SDC's logged position at the end of the scenario
-        (~9 s ahead). The RL agent must work out how to reach it. The point is
-        repeated to ``num_points`` to keep the (num_points, 2) tensor shape.
-
-        Args:
-            sdc_obs: The SDC observation (provides the local-frame pose).
-            state: The simulator state (provides the logged trajectory).
-
-        Returns:
-            An instance of PathTargetFeatures with the goal point.
+        Uses four fixed near-term expert trajectory points and
+        one final goal point. This retains local route geometry
+        while avoiding the widely spaced targets used in V24.
         """
         if not self._path_target_features_key:
             return features.PathTargetFeatures()
 
-        # SDC logged trajectory; pick the last valid step as the ~9 s goal.
-        sdc_index = operations.get_index(state.object_metadata.is_sdc)
-        sdc_log = jax.tree.map(lambda x: x[sdc_index], state.log_trajectory)
-        steps = jnp.arange(sdc_log.valid.shape[-1])
-        last_valid_idx = jnp.max(jnp.where(sdc_log.valid, steps, 0))
-        endpoint_global = sdc_log.xy[last_valid_idx]  # (2,) world frame
+        sdc_index = operations.get_index(
+            state.object_metadata.is_sdc
+        )
 
-        # Transform into the SDC-local frame used by the rest of the observation.
-        endpoint_local = geometry.transform_points(sdc_obs.pose2d.matrix, endpoint_global)
+        sdc_log = jax.tree.map(
+            lambda x: x[sdc_index],
+            state.log_trajectory,
+        )
 
-        # Repeat to keep the (num_points, 2) shape; normalize with the endpoint scale.
-        path_target = jnp.broadcast_to(endpoint_local, (self._num_target_path_points, 2))
-        path_target = extractor.normalize_path(path_target, self._max_meters)
+        steps = jnp.arange(
+            sdc_log.valid.shape[-1]
+        )
 
-        return features.PathTargetFeatures(xy=path_target)
+        last_valid_idx = jnp.max(
+            jnp.where(
+                sdc_log.valid,
+                steps,
+                0,
+            )
+        )
+
+        current_idx = jnp.minimum(
+            state.timestep,
+            last_valid_idx,
+        )
+
+        # Near-term offsets in trajectory steps.
+        #
+        # For a 10 Hz trajectory these correspond approximately
+        # to 0.5 s, 1.0 s, 2.0 s and 4.0 s.
+        near_offsets = jnp.array(
+            [5, 10, 20, 40],
+            dtype=jnp.int32,
+        )
+
+        near_idx = current_idx + near_offsets
+
+        near_idx = jnp.minimum(
+            near_idx,
+            last_valid_idx,
+        )
+
+        # Final point preserves long-term route intent.
+        future_idx = jnp.concatenate(
+            [
+                near_idx,
+                jnp.asarray(
+                    [last_valid_idx],
+                    dtype=jnp.int32,
+                ),
+            ],
+            axis=0,
+        )
+
+        target_global = sdc_log.xy[
+            future_idx
+        ]
+
+        target_local = geometry.transform_points(
+            sdc_obs.pose2d.matrix,
+            target_global,
+        )
+
+        target_local = extractor.normalize_path(
+            target_local,
+            self._max_meters,
+        )
+
+        return features.PathTargetFeatures(
+            xy=target_local
+        )
 
     def _reduce_and_filter_roadgraph_points(
         self, roadgraph: datatypes.RoadgraphPoints
